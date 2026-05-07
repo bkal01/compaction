@@ -26,6 +26,14 @@ config = {
         'c2_method': 'lsq',
         'on_policy': True,
     },
+    'AM-HighestExpectedAttnKeys': {
+        'algorithm': 'highest_expected_attention_keys',
+        'nnls_iters': 2,
+        'nnls_lower_bound': exp(-3),
+        'nnls_upper_bound': exp(3),
+        'c2_method': 'lsq',
+        'on_policy': True,
+    },
     'AM-OMP-basic': {
         'algorithm': 'omp',
         'nnls_iters': 0,
