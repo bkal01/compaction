@@ -139,6 +139,39 @@ class CompactionAlgorithm(ABC):
         sum_exp_C = exp_sC.sum(dim=1, keepdim=True)              # (n, 1)
         X = exp_sC / sum_exp_C                                   # (n, t) normalized
 
+        debug_tensors = {
+            "C1": C1,
+            "beta": beta,
+            "K": K,
+            "V": V,
+            "queries": queries,
+        }
+        return self._solve_C2_regression(
+            X,
+            Y,
+            dtype_param=dtype_param,
+            ridge_lambda=ridge_lambda,
+            solver=solver,
+            ridge_scale=ridge_scale,
+            debug_tensors=debug_tensors,
+        )
+
+    def _solve_C2_regression(
+        self,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        dtype_param: torch.dtype,
+        ridge_lambda: float = 0,
+        solver: str = 'lstsq',
+        ridge_scale: str = 'spectral',
+        debug_tensors: Dict[str, torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Solve X @ C2 ~= Y using the shared C2 regression solver.
+
+        Callers are responsible for constructing the regression design matrix X
+        and target Y in fp32. The result is cast back to dtype_param.
+        """
         # Note: See https://blogs.rstudio.com/ai/posts/2022-10-13-torch-linalg/
         n, t = X.shape
         # Scale ridge lambda by spectral norm or frobenius norm / t or use fixed value
@@ -170,11 +203,9 @@ class CompactionAlgorithm(ABC):
                     raise RuntimeError("NaNs in lstsq solution")
             except Exception as e:
                 print(f"lstsq failed ({e}), increasing lambda to 1e-6 and retrying")
-                print(f"  C1 has NaN: {torch.isnan(C1).any().item()}, Inf: {torch.isinf(C1).any().item()}")
-                print(f"  beta has NaN: {torch.isnan(beta).any().item()}, Inf: {torch.isinf(beta).any().item()}")
-                print(f"  K has NaN: {torch.isnan(K).any().item()}, Inf: {torch.isinf(K).any().item()}")
-                print(f"  V has NaN: {torch.isnan(V).any().item()}, Inf: {torch.isinf(V).any().item()}")
-                print(f"  queries has NaN: {torch.isnan(queries).any().item()}, Inf: {torch.isinf(queries).any().item()}")
+                if debug_tensors is not None:
+                    for name, tensor in debug_tensors.items():
+                        print(f"  {name} has NaN: {torch.isnan(tensor).any().item()}, Inf: {torch.isinf(tensor).any().item()}")
                 print(f"  X has NaN: {torch.isnan(X).any().item()}, Inf: {torch.isinf(X).any().item()}")
                 print(f"  Y has NaN: {torch.isnan(Y).any().item()}, Inf: {torch.isinf(Y).any().item()}")
 
