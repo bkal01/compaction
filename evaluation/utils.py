@@ -421,7 +421,7 @@ def format_question(
     question: str,
     options: Optional[List[str]] = None,
     model_name: Optional[str] = None,
-    enable_thinking: bool = True,
+    enable_thinking: bool = False,
     answer_prefix: Optional[str] = None,
 ) -> str:
     """
