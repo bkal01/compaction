@@ -539,6 +539,10 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_for_stats < -7).sum().item()) if len(beta_for_stats) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+                if head_target_size != 0:
+                    algorithm_diagnostics = getattr(algorithm, 'last_diagnostics', None)
+                    if algorithm_diagnostics:
+                        head_stats.update(algorithm_diagnostics)
 
                 # Compute train stats if requested
                 if compute_stats:
@@ -912,4 +916,3 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
             train_stats_per_head,
             eval_queries_per_kv_head
         )
-
