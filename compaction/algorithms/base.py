@@ -198,7 +198,25 @@ class CompactionAlgorithm(ABC):
             # Use lstsq solver
             # Solves: X @ C2 = Y
             try:
-                C2_32 = torch.linalg.lstsq(X, Y, driver='gels').solution    # (t,d)
+                if ridge_lambda == 0:
+                    C2_32 = torch.linalg.lstsq(X, Y, driver='gels').solution    # (t,d)
+                else:
+                    sqrt_lam = torch.sqrt(torch.as_tensor(lam, dtype=X.dtype, device=X.device))
+                    X_aug = torch.cat(
+                        (
+                            X,
+                            sqrt_lam * torch.eye(t, dtype=X.dtype, device=X.device),
+                        ),
+                        dim=0,
+                    )
+                    Y_aug = torch.cat(
+                        (
+                            Y,
+                            torch.zeros(t, Y.shape[1], dtype=Y.dtype, device=Y.device),
+                        ),
+                        dim=0,
+                    )
+                    C2_32 = torch.linalg.lstsq(X_aug, Y_aug, driver='gels').solution    # (t,d)
                 if torch.isnan(C2_32).any():
                     raise RuntimeError("NaNs in lstsq solution")
             except Exception as e:
@@ -269,6 +287,108 @@ class CompactionAlgorithm(ABC):
             raise ValueError(f"Unknown solver: {solver}. Must be 'pinv', 'cholesky', or 'lstsq'.")
 
         return C2_32.to(dtype_param)
+
+    @staticmethod
+    def _compute_C2_regression_diagnostics(
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        C2: torch.Tensor,
+        ridge_lambda: float = 0,
+        solver: str = 'lstsq',
+        ridge_scale: str = 'spectral',
+        num_zero_order_rows: int = 0,
+    ) -> Dict[str, float]:
+        """
+        Compute small JSON-serializable diagnostics for X @ C2 ~= Y.
+
+        This is intentionally separate from the solver so it can be enabled only
+        for diagnostic runs; SVD-based condition estimates are useful but not
+        free on every layer/head.
+        """
+        with torch.no_grad():
+            X32 = X.to(torch.float32)
+            Y32 = Y.to(torch.float32)
+            C2_32 = C2.to(torch.float32)
+            n, t = X32.shape
+
+            try:
+                # Use the smaller Gram matrix for a cheaper condition estimate.
+                if n <= t:
+                    gram = X32 @ X32.T
+                else:
+                    gram = X32.T @ X32
+                gram = 0.5 * (gram + gram.T)
+                singular_values = torch.sqrt(torch.linalg.eigvalsh(gram).clamp_min(0.0))
+                max_sv = float(singular_values.max().item()) if singular_values.numel() else 0.0
+                eps = torch.finfo(torch.float32).eps
+                rank_tol = max(n, t) * eps * max_sv
+                nonzero_singular_values = singular_values[singular_values > rank_tol]
+                rank = int(nonzero_singular_values.numel())
+                min_sv = float(nonzero_singular_values.min().item()) if rank else 0.0
+                condition_number = (
+                    float(max_sv / min_sv)
+                    if min_sv > 0
+                    else float("inf")
+                )
+            except Exception:
+                max_sv = None
+                min_sv = None
+                rank_tol = None
+                rank = None
+                condition_number = None
+
+            residual = X32 @ C2_32 - Y32
+            residual_norm = float(torch.linalg.vector_norm(residual).item())
+            y_norm = float(torch.linalg.vector_norm(Y32).item())
+            c2_norm = float(torch.linalg.vector_norm(C2_32).item())
+            x_row_norms = torch.linalg.vector_norm(X32, dim=1)
+            x_col_norms = torch.linalg.vector_norm(X32, dim=0)
+
+            diagnostics = {
+                "solver": solver,
+                "ridge_lambda": float(ridge_lambda),
+                "ridge_scale": ridge_scale,
+                "num_equations": int(n),
+                "num_unknown_rows": int(t),
+                "rank": rank,
+                "rank_deficiency": int(min(n, t) - rank) if rank is not None else None,
+                "rank_tol": float(rank_tol) if rank_tol is not None else None,
+                "max_singular_value": max_sv,
+                "min_nonzero_singular_value": min_sv,
+                "condition_number": condition_number,
+                "relative_residual_norm": residual_norm / max(y_norm, 1e-12),
+                "residual_norm": residual_norm,
+                "target_norm": y_norm,
+                "c2_norm": c2_norm,
+                "c2_abs_max": float(C2_32.abs().max().item()) if C2_32.numel() else 0.0,
+                "x_row_norm_min": float(x_row_norms.min().item()) if x_row_norms.numel() else 0.0,
+                "x_row_norm_max": float(x_row_norms.max().item()) if x_row_norms.numel() else 0.0,
+                "x_col_norm_min": float(x_col_norms.min().item()) if x_col_norms.numel() else 0.0,
+                "x_col_norm_max": float(x_col_norms.max().item()) if x_col_norms.numel() else 0.0,
+            }
+            if num_zero_order_rows:
+                zero_residual = residual[:num_zero_order_rows]
+                zero_target = Y32[:num_zero_order_rows]
+                grad_residual = residual[num_zero_order_rows:]
+                grad_target = Y32[num_zero_order_rows:]
+                diagnostics.update({
+                    "zero_order_relative_residual_norm": float(
+                        (
+                            torch.linalg.vector_norm(zero_residual)
+                            / torch.linalg.vector_norm(zero_target).clamp_min(1e-12)
+                        ).item()
+                    ),
+                    "gradient_relative_residual_norm": float(
+                        (
+                            torch.linalg.vector_norm(grad_residual)
+                            / torch.linalg.vector_norm(grad_target).clamp_min(1e-12)
+                        ).item()
+                    ) if grad_target.numel() else None,
+                    "gradient_row_norm_min": float(x_row_norms[num_zero_order_rows:].min().item()) if n > num_zero_order_rows else None,
+                    "gradient_row_norm_max": float(x_row_norms[num_zero_order_rows:].max().item()) if n > num_zero_order_rows else None,
+                    "gradient_row_norm_mean": float(x_row_norms[num_zero_order_rows:].mean().item()) if n > num_zero_order_rows else None,
+                })
+            return diagnostics
 
     def _compute_C2_on_policy(
         self,
