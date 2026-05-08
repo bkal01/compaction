@@ -19,7 +19,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
     def __init__(self, nnls_iters: int = 0, nnls_lower_bound: float = None, nnls_upper_bound: float = None,
                  c2_method: str = 'taylor_lsq', beta_method: str = 'redistribute_uniform',
                  c2_ridge_lambda: float = 0, c2_solver: str = 'lstsq', c2_ridge_scale: str = 'spectral',
-                 pooling: str = None, kernel_size: int = 7):
+                 pooling: str = None, kernel_size: int = 7, c2_diagnostics: bool = False):
         """
         Parameters
         ----------
@@ -53,6 +53,9 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Pooling method to apply to attention scores: 'avgpool', 'maxpool', or None (default: None).
         kernel_size : int
             Kernel size for pooling operation (default: 7).
+        c2_diagnostics : bool
+            If True, store C2 regression diagnostics on this algorithm instance
+            after each compaction. Wrappers can include these in JSON logs.
         """
         self.nnls_iters = nnls_iters
         self.nnls_lower_bound = nnls_lower_bound
@@ -87,6 +90,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             raise ValueError(f"pooling must be 'avgpool', 'maxpool', or None, got '{pooling}'")
         self.pooling = pooling
         self.kernel_size = kernel_size
+        self.c2_diagnostics = c2_diagnostics
+        self.last_diagnostics = {}
 
     def name(self) -> str:
         return "HighestExpectedAttentionKeys"
@@ -126,6 +131,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Indices of selected keys
         """
         # Select keys based on Gaussian expected exp-scores.
+        self.last_diagnostics = {}
         C1, beta, indices = self._select_keys_highest_expected_attention(K, queries, t, attention_bias)
 
         if self.c2_method == "direct":
@@ -150,8 +156,9 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             )
         elif self.c2_method == "taylor_lsq":
             # Compute compacted values by matching value + first derivative at q=mu.
-            C2 = self._compute_C2_via_expectation_with_method(
+            C2 = self._compute_C2_via_expected_taylor_lsq(
                 mu=mu,
+                sigma=sigma,
                 K=K,
                 V=V,
                 C1=C1,
@@ -216,7 +223,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         mu, sigma = queries32.mean(dim=0), queries32.T.cov()
 
         log_expected_unbiased = self._log_expected_exp_scores(K32, mu, sigma)
-        bias32 = self._prepare_attention_bias(attention_bias, (T,))
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
         log_expected = log_expected_unbiased if bias32 is None else log_expected_unbiased + bias32
         key_scores = log_expected
 
@@ -280,21 +287,6 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         return C1, beta, selected_indices_tensor.cpu().tolist()
 
     @staticmethod
-    def _prepare_attention_bias(attention_bias, shape):
-        if attention_bias is None:
-            return None
-        try:
-            return torch.broadcast_to(
-                attention_bias.to(torch.float32),
-                shape
-            )
-        except Exception as e:
-            raise ValueError(
-                f"attention_bias must be broadcastable to {shape}, "
-                f"got {tuple(attention_bias.shape)}"
-            ) from e
-
-    @staticmethod
     def _log_expected_exp_scores(keys, mu, sigma):
         """
         Computes expected attention scores given K and a query distribution
@@ -350,7 +342,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         _, d = K.size()
         inv_sqrt_d = (1.0 / d) ** 0.5
 
-        bias32 = self._prepare_attention_bias(attention_bias, (K.shape[0],))
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
 
         full_scores = K @ mu * inv_sqrt_d
         if bias32 is not None:
@@ -405,7 +397,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         sigma = sigma.to(torch.float32)
 
         log_full = self._log_expected_exp_scores(K, mu, sigma)
-        bias32 = self._prepare_attention_bias(attention_bias, (K.shape[0],))
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
         if bias32 is not None:
             log_full = log_full + bias32
         full_weights = torch.softmax(log_full, dim=0)
@@ -422,7 +414,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             "mu": mu,
             "sigma": sigma,
         }
-        return self._solve_C2_regression(
+        C2 = self._solve_C2_regression(
             X,
             Y,
             dtype_param=dtype_param,
@@ -431,10 +423,23 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             ridge_scale=ridge_scale,
             debug_tensors=debug_tensors,
         )
+        if self.c2_diagnostics:
+            self.last_diagnostics["c2_regression"] = self._compute_C2_regression_diagnostics(
+                X,
+                Y,
+                C2,
+                ridge_lambda=ridge_lambda,
+                solver=solver,
+                ridge_scale=ridge_scale,
+            )
+            self.last_diagnostics["c2_regression"]["c2_method"] = "lsq"
+            self.last_diagnostics["c2_regression"]["target_definition"] = "gaussian_expected_attention"
+        return C2
 
-    def _compute_C2_via_expectation_with_method(
+    def _compute_C2_via_expected_taylor_lsq(
         self,
         mu,
+        sigma,
         K,
         V,
         C1,
@@ -459,19 +464,27 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         C1 = C1.to(torch.float32)
         beta = beta.to(torch.float32)
         mu = mu.to(torch.float32)
+        sigma = sigma.to(torch.float32)
 
         _, d = K.size()
 
         inv_sqrt_d = (1.0 / d) ** 0.5
 
-        bias32 = self._prepare_attention_bias(attention_bias, (K.shape[0],))
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
+
+        log_full = self._log_expected_exp_scores(K, mu, sigma)
+        if bias32 is not None:
+            log_full = log_full + bias32
+        full_weights = torch.softmax(log_full, dim=0)
+        y_expected = (full_weights @ V).unsqueeze(0)
+
+        log_compacted = self._log_expected_exp_scores(C1, mu, sigma) + beta
+        x_expected = torch.softmax(log_compacted, dim=0).unsqueeze(0)
 
         scores = K @ mu * inv_sqrt_d
         if bias32 is not None:
             scores = scores + bias32
-        # we want to compute K^T (diag(a)V) - (K^T a)(a^T V)
         a = torch.nn.functional.softmax(scores, dim=0)
-        y_full = a @ V
         grad_full = K.T @ (a[:, None] * V) - (K.T @ a)[:, None] * (a @ V)[None, :]
         grad_full *= inv_sqrt_d
 
@@ -480,8 +493,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         grad_compacted = (C1 - (b @ C1)[None, :]).T * b[None, :]
         grad_compacted *= inv_sqrt_d
 
-        Y = torch.cat((y_full[None, :], grad_full), dim=0) # (d + 1, d)
-        X = torch.cat((b[None, :], grad_compacted), dim=0) # (d + 1, t)
+        Y = torch.cat((y_expected, grad_full), dim=0) # (d + 1, d)
+        X = torch.cat((x_expected, grad_compacted), dim=0) # (d + 1, t)
 
         debug_tensors = {
             "K": K,
@@ -489,9 +502,10 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             "C1": C1,
             "beta": beta,
             "mu": mu,
+            "sigma": sigma,
             "attention_bias": bias32,
         }
-        return self._solve_C2_regression(
+        C2 = self._solve_C2_regression(
             X,
             Y,
             dtype_param=dtype_param,
@@ -500,3 +514,16 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             ridge_scale=ridge_scale,
             debug_tensors=debug_tensors,
         )
+        if self.c2_diagnostics:
+            self.last_diagnostics["c2_regression"] = self._compute_C2_regression_diagnostics(
+                X,
+                Y,
+                C2,
+                ridge_lambda=ridge_lambda,
+                solver=solver,
+                ridge_scale=ridge_scale,
+                num_zero_order_rows=1,
+            )
+            self.last_diagnostics["c2_regression"]["c2_method"] = "taylor_lsq"
+            self.last_diagnostics["c2_regression"]["target_definition"] = "attention_at_query_mean_plus_jacobian"
+        return C2
