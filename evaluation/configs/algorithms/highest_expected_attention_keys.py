@@ -10,6 +10,7 @@ BASE_EXPECTED = {
     'c2_solver': 'lstsq',
     'c2_ridge_lambda': 0,
     'c2_ridge_scale': 'spectral',
+    'fit_query_subset_size': None,
     'on_policy': True,
 }
 
@@ -22,6 +23,15 @@ def expected(beta_method, c2_method, **overrides):
     }
     cfg.update(overrides)
     return cfg
+
+
+def sampled(beta_method, c2_method, m, **overrides):
+    return expected(
+        beta_method,
+        c2_method,
+        fit_query_subset_size=m,
+        **overrides,
+    )
 
 
 config = {
@@ -96,6 +106,39 @@ config = {
     ),
     'expected_taylorbeta_taylor_ridge1e-2': expected(
         'taylor_nnls', 'taylor_lsq', c2_ridge_lambda=1e-2
+    ),
+
+    # Sampled-query beta/C2 fitting variants. Key selection remains expected
+    # attention; fit_query_subset_size only changes beta/C2 fitting.
+    'expected_redist_lsq_sampled64_ridge1e-2': sampled(
+        'redistribute_uniform', 'lsq', 64, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_sampled128_ridge1e-2': sampled(
+        'redistribute_uniform', 'lsq', 128, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_sampled256_ridge1e-2': sampled(
+        'redistribute_uniform', 'lsq', 256, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_sampled512_ridge1e-2': sampled(
+        'redistribute_uniform', 'lsq', 512, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_lsq_sampled64_ridge1e-2': sampled(
+        'nnls', 'lsq', 64, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_lsq_sampled128_ridge1e-2': sampled(
+        'nnls', 'lsq', 128, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_lsq_sampled256_ridge1e-2': sampled(
+        'nnls', 'lsq', 256, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_lsq_sampled512_ridge1e-2': sampled(
+        'nnls', 'lsq', 512, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_sampled256': sampled(
+        'redistribute_uniform', 'lsq', 256
+    ),
+    'expected_nnls_lsq_sampled256': sampled(
+        'nnls', 'lsq', 256
     ),
 
     # Diagnostic variants for inspecting C2 regression conditioning/residuals.

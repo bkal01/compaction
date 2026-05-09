@@ -19,7 +19,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
     def __init__(self, nnls_iters: int = 0, nnls_lower_bound: float = None, nnls_upper_bound: float = None,
                  c2_method: str = 'taylor_lsq', beta_method: str = 'redistribute_uniform',
                  c2_ridge_lambda: float = 0, c2_solver: str = 'lstsq', c2_ridge_scale: str = 'spectral',
-                 pooling: str = None, kernel_size: int = 7, c2_diagnostics: bool = False):
+                 pooling: str = None, kernel_size: int = 7, c2_diagnostics: bool = False,
+                 fit_query_subset_size: int = None):
         """
         Parameters
         ----------
@@ -56,10 +57,18 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         c2_diagnostics : bool
             If True, store C2 regression diagnostics on this algorithm instance
             after each compaction. Wrappers can include these in JSON logs.
+        fit_query_subset_size : int, optional
+            Number of generated queries to use for beta/C2 fitting. If None, no
+            fit-query subset is passed to downstream fitting.
         """
         self.nnls_iters = nnls_iters
         self.nnls_lower_bound = nnls_lower_bound
         self.nnls_upper_bound = nnls_upper_bound
+        if fit_query_subset_size is not None and not isinstance(fit_query_subset_size, int):
+            raise ValueError(
+                "fit_query_subset_size must be None or an int, "
+                f"got {type(fit_query_subset_size).__name__}"
+            )
         if c2_method not in ['lsq', 'taylor_lsq', 'direct']:
             raise ValueError(
                 "c2_method must be 'lsq', 'taylor_lsq', or 'direct', "
@@ -91,6 +100,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         self.pooling = pooling
         self.kernel_size = kernel_size
         self.c2_diagnostics = c2_diagnostics
+        self.fit_query_subset_size = fit_query_subset_size
         self.last_diagnostics = {}
 
     def name(self) -> str:
@@ -132,7 +142,9 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         """
         # Select keys based on Gaussian expected exp-scores.
         self.last_diagnostics = {}
-        C1, beta, indices = self._select_keys_highest_expected_attention(K, queries, t, attention_bias)
+        C1, beta, indices, fit_queries = self._select_keys_highest_expected_attention(
+            K, queries, t, attention_bias, fit_query_subset_size=self.fit_query_subset_size
+        )
 
         if self.c2_method == "direct":
             C2 = self._direct_C2(C1, K, V, indices)
@@ -142,32 +154,58 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         sigma = queries.to(torch.float32).T.cov()
 
         if self.c2_method == "lsq":
-            C2 = self._compute_C2_via_expected_lsq(
-                mu=mu,
-                sigma=sigma,
-                K=K,
-                V=V,
-                C1=C1,
-                beta=beta,
-                attention_bias=attention_bias,
-                solver=self.c2_solver,
-                ridge_lambda=self.c2_ridge_lambda,
-                ridge_scale=self.c2_ridge_scale,
-            )
+            if fit_queries is None:
+                C2 = self._compute_C2_via_expected_lsq(
+                    mu=mu,
+                    sigma=sigma,
+                    K=K,
+                    V=V,
+                    C1=C1,
+                    beta=beta,
+                    attention_bias=attention_bias,
+                    solver=self.c2_solver,
+                    ridge_lambda=self.c2_ridge_lambda,
+                    ridge_scale=self.c2_ridge_scale,
+                )
+            else:
+                C2 = self._compute_C2_via_sampled_lsq(
+                    K=K,
+                    V=V,
+                    C1=C1,
+                    beta=beta,
+                    fit_queries=fit_queries,
+                    attention_bias=attention_bias,
+                    solver=self.c2_solver,
+                    ridge_lambda=self.c2_ridge_lambda,
+                    ridge_scale=self.c2_ridge_scale,
+                )
         elif self.c2_method == "taylor_lsq":
-            # Compute compacted values by matching value + first derivative at q=mu.
-            C2 = self._compute_C2_via_expected_taylor_lsq(
-                mu=mu,
-                sigma=sigma,
-                K=K,
-                V=V,
-                C1=C1,
-                beta=beta,
-                attention_bias=attention_bias,
-                solver=self.c2_solver,
-                ridge_lambda=self.c2_ridge_lambda,
-                ridge_scale=self.c2_ridge_scale,
-            )
+            if fit_queries is None:
+                # Compute compacted values by matching value + first derivative at q=mu.
+                C2 = self._compute_C2_via_expected_taylor_lsq(
+                    mu=mu,
+                    sigma=sigma,
+                    K=K,
+                    V=V,
+                    C1=C1,
+                    beta=beta,
+                    attention_bias=attention_bias,
+                    solver=self.c2_solver,
+                    ridge_lambda=self.c2_ridge_lambda,
+                    ridge_scale=self.c2_ridge_scale,
+                )
+            else:
+                C2 = self._compute_C2_via_sampled_lsq(
+                    K=K,
+                    V=V,
+                    C1=C1,
+                    beta=beta,
+                    fit_queries=fit_queries,
+                    attention_bias=attention_bias,
+                    solver=self.c2_solver,
+                    ridge_lambda=self.c2_ridge_lambda,
+                    ridge_scale=self.c2_ridge_scale,
+                )
         else:
             raise ValueError(
                 f"Unsupported c2_method '{self.c2_method}' for HighestExpectedAttentionKeysCompaction"
@@ -181,6 +219,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         queries: torch.Tensor,
         t: int,
         attention_bias: torch.Tensor = None,
+        fit_query_subset_size: int = None,
     ):
         """
         Select t keys from K with highest Gaussian expected exp-scores.
@@ -195,6 +234,9 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Number of keys to select for the compacted cache.
         attention_bias : Tensor, optional
             Additive per-key attention bias for the original cache (broadcastable to (T,)).
+        fit_query_subset_size : int, optional
+            Number of generated queries to use for beta/C2 fitting. If None, no
+            fit-query subset is passed to downstream fitting.
 
         Returns
         -------
@@ -204,6 +246,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Bias terms for each selected key.
         indices : list of int
             Indices of the selected keys in the original K.
+        fit_queries : Tensor, shape (m, d)
+            Query samples for beta/C2 fitting.
         """
         """
         we are going to do this as follows:
@@ -242,6 +286,14 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         _, selected_indices_tensor = torch.topk(key_scores, t, largest=True)
         C1 = K[selected_indices_tensor]
 
+        if fit_query_subset_size is None:
+            fit_queries = None
+        elif fit_query_subset_size >= n:
+            fit_queries = queries
+        else:
+            fit_query_indices = torch.randperm(n, device=device)[:fit_query_subset_size]
+            fit_queries = queries[fit_query_indices]
+
         if self.beta_method == 'zero':
             # Set all beta values to 0 (compute in fp32, then convert to model dtype)
             beta32 = torch.zeros(t, dtype=torch.float32, device=device)
@@ -249,24 +301,42 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         # due to compaction. This branch estimates and redistributes expected
         # mass without materializing QK^T, which is required for the NNLS targets.
         elif self.beta_method == "redistribute_uniform":
-            expected_mass = torch.exp(log_expected.clamp(min=-60.0, max=60.0))
-            selected_mass = expected_mass[selected_indices_tensor]
-            selected_base_mass = torch.exp(
-                log_expected_unbiased[selected_indices_tensor].clamp(min=-60.0, max=60.0)
-            )
-            missing_mass = (expected_mass.sum() - selected_mass.sum()).clamp_min(0.0)
-            beta32 = torch.log(
-                (selected_mass + missing_mass / t).clamp_min(1e-12)
-                / selected_base_mass.clamp_min(1e-12)
-            )
+            if fit_queries is None:
+                expected_mass = torch.exp(log_expected.clamp(min=-60.0, max=60.0))
+                selected_mass = expected_mass[selected_indices_tensor]
+                selected_base_mass = torch.exp(
+                    log_expected_unbiased[selected_indices_tensor].clamp(min=-60.0, max=60.0)
+                )
+                missing_mass = (expected_mass.sum() - selected_mass.sum()).clamp_min(0.0)
+                beta32 = torch.log(
+                    (selected_mass + missing_mass / t).clamp_min(1e-12)
+                    / selected_base_mass.clamp_min(1e-12)
+                )
+            else:
+                beta32 = self._compute_beta_via_sampled_redistribute_uniform(
+                    K32,
+                    C1.to(torch.float32),
+                    fit_queries,
+                    attention_bias=bias32,
+                )
         elif self.beta_method == "nnls":
-            selected_log_expected = log_expected_unbiased[selected_indices_tensor]
-            beta32 = self._compute_beta_via_expected_nnls(
-                log_expected,
-                selected_log_expected,
-                lower_bound=self.nnls_lower_bound,
-                upper_bound=self.nnls_upper_bound,
-            )
+            if fit_queries is None:
+                selected_log_expected = log_expected_unbiased[selected_indices_tensor]
+                beta32 = self._compute_beta_via_expected_nnls(
+                    log_expected,
+                    selected_log_expected,
+                    lower_bound=self.nnls_lower_bound,
+                    upper_bound=self.nnls_upper_bound,
+                )
+            else:
+                beta32 = self._compute_beta_via_sampled_nnls(
+                    K32,
+                    C1.to(torch.float32),
+                    fit_queries,
+                    attention_bias=bias32,
+                    lower_bound=self.nnls_lower_bound,
+                    upper_bound=self.nnls_upper_bound,
+                )
         elif self.beta_method == "taylor_nnls":
             beta32 = self._compute_beta_via_taylor_nnls(
                 mu,
@@ -284,7 +354,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         # Convert beta from fp32 to model dtype (e.g., bf16) for storage
         beta = beta32.to(dtype_param)
 
-        return C1, beta, selected_indices_tensor.cpu().tolist()
+        return C1, beta, selected_indices_tensor.cpu().tolist(), fit_queries
 
     @staticmethod
     def _log_expected_exp_scores(keys, mu, sigma):
@@ -315,6 +385,80 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
 
         target = expected_mass.sum().unsqueeze(0)
         M = selected_mass.unsqueeze(0)
+        weights = self._nnls_pg(
+            M,
+            target,
+            self.nnls_iters,
+            lower_bound,
+            upper_bound,
+        )
+        return torch.log(weights)
+
+    def _compute_beta_via_sampled_redistribute_uniform(
+        self,
+        K,
+        C1,
+        fit_queries,
+        attention_bias=None,
+    ):
+        """
+        Compute beta by uniformly redistributing sampled-query missing attention mass.
+        """
+        _, d = K.size()
+        t = C1.shape[0]
+        inv_sqrt_d = (1.0 / d) ** 0.5
+
+        fit_queries = fit_queries.to(torch.float32)
+        K = K.to(torch.float32)
+        C1 = C1.to(torch.float32)
+
+        full_scores = fit_queries @ K.T * inv_sqrt_d
+        if attention_bias is not None:
+            full_scores = full_scores + attention_bias.to(torch.float32)
+        compacted_scores = fit_queries @ C1.T * inv_sqrt_d
+        ref = torch.maximum(full_scores.max(dim=1, keepdim=True).values,
+                            compacted_scores.max(dim=1, keepdim=True).values)
+
+        full_mass = torch.exp((full_scores - ref).clamp(min=-60.0, max=60.0)).sum(dim=1)
+        compacted_mass = torch.exp((compacted_scores - ref).clamp(min=-60.0, max=60.0))
+        selected_base_mass = compacted_mass.mean(dim=0)
+        missing_mass = (full_mass - compacted_mass.sum(dim=1)).clamp_min(0.0).mean()
+
+        return torch.log(
+            (selected_base_mass + missing_mass / t).clamp_min(1e-12)
+            / selected_base_mass.clamp_min(1e-12)
+        )
+
+    def _compute_beta_via_sampled_nnls(
+        self,
+        K,
+        C1,
+        fit_queries,
+        attention_bias=None,
+        lower_bound=None,
+        upper_bound=None,
+    ):
+        """
+        Solve for beta in the sampled-query attention mass matching setup using
+        (non-negative) least squares.
+        """
+        _, d = K.size()
+        inv_sqrt_d = (1.0 / d) ** 0.5
+
+        fit_queries = fit_queries.to(torch.float32)
+        K = K.to(torch.float32)
+        C1 = C1.to(torch.float32)
+
+        full_scores = fit_queries @ K.T * inv_sqrt_d
+        if attention_bias is not None:
+            full_scores = full_scores + attention_bias.to(torch.float32)
+        compacted_scores = fit_queries @ C1.T * inv_sqrt_d
+        ref = torch.maximum(full_scores.max(dim=1, keepdim=True).values,
+                            compacted_scores.max(dim=1, keepdim=True).values)
+
+        target = torch.exp((full_scores - ref).clamp(min=-60.0, max=60.0)).sum(dim=1)
+        M = torch.exp((compacted_scores - ref).clamp(min=-60.0, max=60.0))
+
         weights = self._nnls_pg(
             M,
             target,
@@ -434,6 +578,72 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             )
             self.last_diagnostics["c2_regression"]["c2_method"] = "lsq"
             self.last_diagnostics["c2_regression"]["target_definition"] = "gaussian_expected_attention"
+        return C2
+
+    def _compute_C2_via_sampled_lsq(
+        self,
+        K,
+        V,
+        C1,
+        beta,
+        fit_queries,
+        solver,
+        attention_bias=None,
+        ridge_lambda=0,
+        ridge_scale='spectral',
+    ):
+        """
+        Solve for C2 (the compacted values) in the sampled-query attention output
+        matching setup using least squares.
+        """
+        dtype_param = K.dtype
+        K = K.to(torch.float32)
+        V = V.to(torch.float32)
+        C1 = C1.to(torch.float32)
+        beta = beta.to(torch.float32)
+        fit_queries = fit_queries.to(torch.float32)
+
+        _, d = K.size()
+        inv_sqrt_d = (1.0 / d) ** 0.5
+
+        full_scores = fit_queries @ K.T * inv_sqrt_d
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
+        if bias32 is not None:
+            full_scores = full_scores + bias32
+        full_weights = torch.softmax(full_scores, dim=1)
+        Y = full_weights @ V
+
+        compacted_scores = fit_queries @ C1.T * inv_sqrt_d + beta
+        X = torch.softmax(compacted_scores, dim=1)
+
+        debug_tensors = {
+            "K": K,
+            "V": V,
+            "C1": C1,
+            "beta": beta,
+            "fit_queries": fit_queries,
+            "attention_bias": bias32,
+        }
+        C2 = self._solve_C2_regression(
+            X,
+            Y,
+            dtype_param=dtype_param,
+            ridge_lambda=ridge_lambda,
+            solver=solver,
+            ridge_scale=ridge_scale,
+            debug_tensors=debug_tensors,
+        )
+        if self.c2_diagnostics:
+            self.last_diagnostics["c2_regression"] = self._compute_C2_regression_diagnostics(
+                X,
+                Y,
+                C2,
+                ridge_lambda=ridge_lambda,
+                solver=solver,
+                ridge_scale=ridge_scale,
+            )
+            self.last_diagnostics["c2_regression"]["c2_method"] = "sampled_lsq"
+            self.last_diagnostics["c2_regression"]["target_definition"] = "sampled_query_attention"
         return C2
 
     def _compute_C2_via_expected_taylor_lsq(
