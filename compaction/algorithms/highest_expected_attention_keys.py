@@ -17,10 +17,10 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
     """Select keys with highest average expected attention scores."""
 
     def __init__(self, nnls_iters: int = 0, nnls_lower_bound: float = None, nnls_upper_bound: float = None,
-                 c2_method: str = 'taylor_lsq', beta_method: str = 'redistribute_uniform',
+                 score_method: str = 'mean', c2_method: str = 'taylor_lsq', beta_method: str = 'redistribute_uniform',
                  c2_ridge_lambda: float = 0, c2_solver: str = 'lstsq', c2_ridge_scale: str = 'spectral',
                  pooling: str = None, kernel_size: int = 7, c2_diagnostics: bool = False,
-                 fit_query_subset_size: int = None):
+                 fit_query_subset_size: int = None, use_synthetic_queries: bool = False):
         """
         Parameters
         ----------
@@ -34,6 +34,11 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         nnls_upper_bound : float, optional
             Optional upper bound for exp(beta) in beta_method='nnls' and
             beta_method='taylor_nnls'.
+        score_method : str, optional
+            Method to score keys when fit_query_subset_size is set: 'max' for
+            maximum attention, 'mean' for mean attention (default), or 'rms'
+            for rms attention. When fit_query_subset_size is None, key scoring
+            uses Gaussian expected exp-scores.
         c2_method : str
             Method to compute C2: 'taylor_lsq' for Taylor least squares around
             the query mean (default), 'lsq' for underdetermined expected-output
@@ -60,6 +65,10 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         fit_query_subset_size : int, optional
             Number of generated queries to use for beta/C2 fitting. If None, no
             fit-query subset is passed to downstream fitting.
+        use_synthetic_queries : bool, optional
+            If True and fit_query_subset_size is set, generate deterministic
+            sigma-point fit queries from the empirical query Gaussian instead
+            of sampling real query vectors.
         """
         self.nnls_iters = nnls_iters
         self.nnls_lower_bound = nnls_lower_bound
@@ -69,6 +78,9 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
                 "fit_query_subset_size must be None or an int, "
                 f"got {type(fit_query_subset_size).__name__}"
             )
+        if score_method not in ['mean', 'rms', 'max']:
+            raise ValueError(f"score_method must be 'mean', 'rms', or 'max', got '{score_method}'")
+        self.score_method = score_method
         if c2_method not in ['lsq', 'taylor_lsq', 'direct']:
             raise ValueError(
                 "c2_method must be 'lsq', 'taylor_lsq', or 'direct', "
@@ -101,6 +113,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         self.kernel_size = kernel_size
         self.c2_diagnostics = c2_diagnostics
         self.fit_query_subset_size = fit_query_subset_size
+        self.use_synthetic_queries = use_synthetic_queries
         self.last_diagnostics = {}
 
     def name(self) -> str:
@@ -143,7 +156,12 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         # Select keys based on Gaussian expected exp-scores.
         self.last_diagnostics = {}
         C1, beta, indices, fit_queries = self._select_keys_highest_expected_attention(
-            K, queries, t, attention_bias, fit_query_subset_size=self.fit_query_subset_size
+            K,
+            queries,
+            t,
+            attention_bias,
+            fit_query_subset_size=self.fit_query_subset_size,
+            use_synthetic_queries=self.use_synthetic_queries,
         )
 
         if self.c2_method == "direct":
@@ -220,6 +238,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         t: int,
         attention_bias: torch.Tensor = None,
         fit_query_subset_size: int = None,
+        use_synthetic_queries: bool = False,
     ):
         """
         Select t keys from K with highest Gaussian expected exp-scores.
@@ -237,6 +256,10 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         fit_query_subset_size : int, optional
             Number of generated queries to use for beta/C2 fitting. If None, no
             fit-query subset is passed to downstream fitting.
+        use_synthetic_queries: bool, optional
+            If True and fit_query_subset_size is not None, then generate synthetic queries
+            for selecting keys and doing attention matching. The synthetic queries are generated
+            using the top covariance directions of the training queries.
 
         Returns
         -------
@@ -262,14 +285,42 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         device = K.device
         dtype_param = K.dtype
 
+        inv_sqrt_d = (1.0 / d) ** 0.5
+
         queries32, K32 = queries.to(torch.float32), K.to(torch.float32)
+        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
 
         mu, sigma = queries32.mean(dim=0), queries32.T.cov()
 
-        log_expected_unbiased = self._log_expected_exp_scores(K32, mu, sigma)
-        bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
-        log_expected = log_expected_unbiased if bias32 is None else log_expected_unbiased + bias32
-        key_scores = log_expected
+        if fit_query_subset_size is None:
+            fit_queries = None
+
+            log_expected_unbiased = self._log_expected_exp_scores(K32, mu, sigma)
+            log_expected = log_expected_unbiased + bias32 if bias32 is not None else log_expected_unbiased
+            key_scores = log_expected
+        elif not use_synthetic_queries and fit_query_subset_size >= n:
+            raise ValueError("fit_query_subset_size must be less than the number of training queries")
+        else:
+            if use_synthetic_queries:
+                fit_queries = self._generate_synthetic_fit_queries(mu, sigma, fit_query_subset_size)
+            else:
+                fit_query_indices = torch.randperm(n, device=device)[:fit_query_subset_size]
+                fit_queries = queries[fit_query_indices]
+
+            fit_queries = fit_queries.to(dtype_param)
+            scores_raw = fit_queries @ K.T
+            scores32 = scores_raw.to(torch.float32) * inv_sqrt_d
+            scores32 = scores32 + bias32 if bias32 is not None else scores32
+            row_max = scores32.max(dim=1, keepdim=True).values
+            exp_scores = torch.exp(scores32 - row_max)
+            attention_weights = exp_scores / exp_scores.sum(dim=1, keepdim=True)
+
+            if self.score_method == 'rms':
+                key_scores = torch.sqrt((attention_weights ** 2).mean(dim=0))
+            elif self.score_method == 'max':
+                key_scores = attention_weights.max(dim=0).values
+            else:
+                key_scores = attention_weights.mean(dim=0)
 
         # Apply pooling if specified
         if self.pooling is not None:
@@ -285,14 +336,6 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
 
         _, selected_indices_tensor = torch.topk(key_scores, t, largest=True)
         C1 = K[selected_indices_tensor]
-
-        if fit_query_subset_size is None:
-            fit_queries = None
-        elif fit_query_subset_size >= n:
-            fit_queries = queries
-        else:
-            fit_query_indices = torch.randperm(n, device=device)[:fit_query_subset_size]
-            fit_queries = queries[fit_query_indices]
 
         if self.beta_method == 'zero':
             # Set all beta values to 0 (compute in fp32, then convert to model dtype)
@@ -314,8 +357,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
                 )
             else:
                 beta32 = self._compute_beta_via_sampled_redistribute_uniform(
-                    K32,
-                    C1.to(torch.float32),
+                    K,
+                    C1,
                     fit_queries,
                     attention_bias=bias32,
                 )
@@ -330,8 +373,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
                 )
             else:
                 beta32 = self._compute_beta_via_sampled_nnls(
-                    K32,
-                    C1.to(torch.float32),
+                    K,
+                    C1,
                     fit_queries,
                     attention_bias=bias32,
                     lower_bound=self.nnls_lower_bound,
@@ -355,6 +398,48 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         beta = beta32.to(dtype_param)
 
         return C1, beta, selected_indices_tensor.cpu().tolist(), fit_queries
+
+    @staticmethod
+    def _generate_synthetic_fit_queries(mu, sigma, num_queries):
+        """
+        Generate simple Gaussian sigma-point queries from mean/covariance.
+
+        The construction is:
+            mu
+            mu +/- sqrt(lambda_i) * u_i for top covariance eigenvectors u_i
+        """
+        if num_queries < 1:
+            raise ValueError("fit_query_subset_size must be at least 1 when using synthetic queries")
+
+        d = mu.numel()
+        max_queries = 2 * d + 1
+        if num_queries > max_queries:
+            raise ValueError(
+                "fit_query_subset_size is too large for simple sigma-point synthetic queries: "
+                f"got {num_queries}, maximum is {max_queries} for head_dim={d}"
+            )
+
+        sigma = 0.5 * (sigma + sigma.T)
+        eigvals, eigvecs = torch.linalg.eigh(sigma) # we do the naive O(d^3) approach for now to check correctness
+        eigvals = eigvals.clamp_min(0.0)
+        order = torch.argsort(eigvals, descending=True)
+
+        parts = [mu.unsqueeze(0)]
+        pair_count = (num_queries - 1) // 2
+        has_extra_plus = (num_queries - 1) % 2 == 1
+
+        if pair_count > 0:
+            pair_idx = order[:pair_count]
+            offsets = eigvecs[:, pair_idx].T * torch.sqrt(eigvals[pair_idx]).unsqueeze(1)
+            parts.append(mu.unsqueeze(0) + offsets)
+            parts.append(mu.unsqueeze(0) - offsets)
+
+        if has_extra_plus:
+            extra_idx = order[pair_count]
+            offset = eigvecs[:, extra_idx] * torch.sqrt(eigvals[extra_idx])
+            parts.append((mu + offset).unsqueeze(0))
+
+        return torch.cat(parts, dim=0)[:num_queries]
 
     @staticmethod
     def _log_expected_exp_scores(keys, mu, sigma):
@@ -408,14 +493,13 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         t = C1.shape[0]
         inv_sqrt_d = (1.0 / d) ** 0.5
 
-        fit_queries = fit_queries.to(torch.float32)
-        K = K.to(torch.float32)
-        C1 = C1.to(torch.float32)
+        dtype_param = K.dtype
+        fit_queries_param = fit_queries.to(dtype_param)
 
-        full_scores = fit_queries @ K.T * inv_sqrt_d
+        full_scores = (fit_queries_param @ K.T).to(torch.float32) * inv_sqrt_d
         if attention_bias is not None:
             full_scores = full_scores + attention_bias.to(torch.float32)
-        compacted_scores = fit_queries @ C1.T * inv_sqrt_d
+        compacted_scores = (fit_queries_param @ C1.T).to(torch.float32) * inv_sqrt_d
         ref = torch.maximum(full_scores.max(dim=1, keepdim=True).values,
                             compacted_scores.max(dim=1, keepdim=True).values)
 
@@ -445,14 +529,13 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         _, d = K.size()
         inv_sqrt_d = (1.0 / d) ** 0.5
 
-        fit_queries = fit_queries.to(torch.float32)
-        K = K.to(torch.float32)
-        C1 = C1.to(torch.float32)
+        dtype_param = K.dtype
+        fit_queries_param = fit_queries.to(dtype_param)
 
-        full_scores = fit_queries @ K.T * inv_sqrt_d
+        full_scores = (fit_queries_param @ K.T).to(torch.float32) * inv_sqrt_d
         if attention_bias is not None:
             full_scores = full_scores + attention_bias.to(torch.float32)
-        compacted_scores = fit_queries @ C1.T * inv_sqrt_d
+        compacted_scores = (fit_queries_param @ C1.T).to(torch.float32) * inv_sqrt_d
         ref = torch.maximum(full_scores.max(dim=1, keepdim=True).values,
                             compacted_scores.max(dim=1, keepdim=True).values)
 
@@ -597,31 +680,31 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         matching setup using least squares.
         """
         dtype_param = K.dtype
-        K = K.to(torch.float32)
-        V = V.to(torch.float32)
-        C1 = C1.to(torch.float32)
-        beta = beta.to(torch.float32)
-        fit_queries = fit_queries.to(torch.float32)
+        K_param = K
+        V32 = V.to(torch.float32)
+        C1_param = C1
+        beta32 = beta.to(torch.float32)
+        fit_queries_param = fit_queries.to(dtype_param)
 
         _, d = K.size()
         inv_sqrt_d = (1.0 / d) ** 0.5
 
-        full_scores = fit_queries @ K.T * inv_sqrt_d
+        full_scores = (fit_queries_param @ K_param.T).to(torch.float32) * inv_sqrt_d
         bias32 = None if attention_bias is None else attention_bias.to(torch.float32)
         if bias32 is not None:
             full_scores = full_scores + bias32
         full_weights = torch.softmax(full_scores, dim=1)
-        Y = full_weights @ V
+        Y = full_weights @ V32
 
-        compacted_scores = fit_queries @ C1.T * inv_sqrt_d + beta
+        compacted_scores = (fit_queries_param @ C1_param.T).to(torch.float32) * inv_sqrt_d + beta32
         X = torch.softmax(compacted_scores, dim=1)
 
         debug_tensors = {
-            "K": K,
+            "K": K_param,
             "V": V,
-            "C1": C1,
+            "C1": C1_param,
             "beta": beta,
-            "fit_queries": fit_queries,
+            "fit_queries": fit_queries_param,
             "attention_bias": bias32,
         }
         C2 = self._solve_C2_regression(
