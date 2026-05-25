@@ -4,8 +4,8 @@ exp = math.exp
 
 BASE_EXPECTED = {
     'algorithm': 'highest_expected_attention_keys',
-    # Only affects methods with fit_query_subset_size set. Non-sampled expected
-    # methods use Gaussian expected exp-score key selection.
+    # Only affects methods with fit_query_subset_method set. Expected methods
+    # use Gaussian expected exp-score key selection.
     'score_method': 'rms',
     'nnls_iters': 2,
     'nnls_lower_bound': exp(-3),
@@ -13,6 +13,7 @@ BASE_EXPECTED = {
     'c2_solver': 'lstsq',
     'c2_ridge_lambda': 0,
     'c2_ridge_scale': 'spectral',
+    'fit_query_subset_method': None,
     'fit_query_subset_size': None,
     'on_policy': True,
 }
@@ -33,18 +34,30 @@ def sampled(beta_method, c2_method, m, score_method='rms', **overrides):
         beta_method,
         c2_method,
         score_method=score_method,
+        fit_query_subset_method='sampled',
         fit_query_subset_size=m,
         **overrides,
     )
 
 
 def synthetic(beta_method, c2_method, m, score_method='rms', **overrides):
-    return sampled(
+    return expected(
         beta_method,
         c2_method,
-        m,
         score_method=score_method,
-        use_synthetic_queries=True,
+        fit_query_subset_method='synthetic',
+        fit_query_subset_size=m,
+        **overrides,
+    )
+
+
+def mahalanobis(beta_method, c2_method, m, score_method='rms', **overrides):
+    return expected(
+        beta_method,
+        c2_method,
+        score_method=score_method,
+        fit_query_subset_method='mahalanobis_sample',
+        fit_query_subset_size=m,
         **overrides,
     )
 
@@ -61,6 +74,18 @@ config = {
         'c2_method': 'lsq',
         'c2_solver': 'lstsq',
         'c2_ridge_lambda': 0,
+        'c2_ridge_scale': 'spectral',
+        'on_policy': True,
+    },
+    'high_attn_ridge1e-2': {
+        'algorithm': 'highest_attention_keys',
+        'score_method': 'rms',
+        'nnls_iters': 2,
+        'nnls_lower_bound': exp(-3),
+        'nnls_upper_bound': exp(3),
+        'c2_method': 'lsq',
+        'c2_solver': 'lstsq',
+        'c2_ridge_lambda': 1e-2,
         'c2_ridge_scale': 'spectral',
         'on_policy': True,
     },
@@ -123,10 +148,10 @@ config = {
         'taylor_nnls', 'taylor_lsq', c2_ridge_lambda=1e-2
     ),
 
-    # Sampled-query key selection + beta/C2 fitting variants. When
-    # fit_query_subset_size is set, the sampled queries are used like ordinary
-    # attention queries: score keys by mean/max/rms attention mass, then fit
-    # beta/C2 against the same sampled-query attention constraints.
+    # Sampled-query key selection + beta/C2 fitting variants. The sampled
+    # queries are used like ordinary attention queries: score keys by
+    # mean/max/rms attention mass, then fit beta/C2 against the same
+    # sampled-query attention constraints.
     'expected_redist_lsq_sampled64_ridge1e-2': sampled(
         'redistribute_uniform', 'lsq', 64, c2_ridge_lambda=1e-2
     ),
@@ -148,6 +173,9 @@ config = {
     'expected_redist_lsq_sampled512_ridge1e-2': sampled(
         'redistribute_uniform', 'lsq', 512, c2_ridge_lambda=1e-2
     ),
+    'expected_redist_lsq_sampled1024_ridge1e-2': sampled(
+        'redistribute_uniform', 'lsq', 1024, c2_ridge_lambda=1e-2
+    ),
     'expected_nnls_lsq_sampled64_ridge1e-2': sampled(
         'nnls', 'lsq', 64, c2_ridge_lambda=1e-2
     ),
@@ -160,11 +188,51 @@ config = {
     'expected_nnls_lsq_sampled512_ridge1e-2': sampled(
         'nnls', 'lsq', 512, c2_ridge_lambda=1e-2
     ),
+    'expected_nnls_lsq_sampled1024_ridge1e-2': sampled(
+        'nnls', 'lsq', 1024, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_direct_sampled256': sampled(
+        'nnls', 'direct', 256
+    ),
+    'expected_zero_direct_sampled256': sampled(
+        'zero', 'direct', 256
+    ),
+    'expected_redist_direct_sampled256': sampled(
+        'redistribute_uniform', 'direct', 256
+    ),
     'expected_redist_lsq_sampled256': sampled(
         'redistribute_uniform', 'lsq', 256
     ),
     'expected_nnls_lsq_sampled256': sampled(
         'nnls', 'lsq', 256
+    ),
+
+    # Mahalanobis-query key selection + beta/C2 fitting variants. These use the
+    # real queries furthest from the empirical Gaussian fit, then follow the same
+    # attention scoring and ridge LSQ path.
+    'expected_redist_lsq_mahalanobis256_ridge1e-2': mahalanobis(
+        'redistribute_uniform', 'lsq', 256, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_mahalanobis256_ridge1e-1': mahalanobis(
+        'redistribute_uniform', 'lsq', 256, c2_ridge_lambda=1e-1
+    ),
+    'expected_redist_lsq_mahalanobis1024_ridge1e-2': mahalanobis(
+        'redistribute_uniform', 'lsq', 1024, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_direct_mahalanobis256': mahalanobis(
+        'redistribute_uniform', 'direct', 256
+    ),
+    'expected_zero_direct_mahalanobis256': mahalanobis(
+        'zero', 'direct', 256
+    ),
+    'expected_nnls_lsq_mahalanobis256_ridge1e-2': mahalanobis(
+        'nnls', 'lsq', 256, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_lsq_mahalanobis1024_ridge1e-2': mahalanobis(
+        'nnls', 'lsq', 1024, c2_ridge_lambda=1e-2
+    ),
+    'expected_nnls_direct_mahalanobis256': mahalanobis(
+        'nnls', 'direct', 256
     ),
 
     # Synthetic-query key selection + beta/C2 fitting variants. These use
@@ -191,5 +259,17 @@ config = {
     ),
     'expected_redist_taylor_ridge1e-2_diag': expected(
         'redistribute_uniform', 'taylor_lsq', c2_ridge_lambda=1e-2, c2_diagnostics=True
+    ),
+    'expected_redist_lsq_sampled256_ridge1e-2_diag': sampled(
+        'redistribute_uniform', 'lsq', 256, c2_ridge_lambda=1e-2, c2_diagnostics=True
+    ),
+    'expected_redist_lsq_mahalanobis256_ridge1e-2_diag': mahalanobis(
+        'redistribute_uniform', 'lsq', 256, c2_ridge_lambda=1e-2, c2_diagnostics=True
+    ),
+    'expected_nnls_lsq_sampled256_ridge1e-2_diag': sampled(
+        'nnls', 'lsq', 256, c2_ridge_lambda=1e-2, c2_diagnostics=True
+    ),
+    'expected_nnls_lsq_mahalanobis256_ridge1e-2_diag': mahalanobis(
+        'nnls', 'lsq', 256, c2_ridge_lambda=1e-2, c2_diagnostics=True
     ),
 }
