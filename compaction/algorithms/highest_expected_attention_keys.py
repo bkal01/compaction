@@ -66,8 +66,10 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Method to produce fit queries when fit_query_subset_size is set:
             'random_sample'/'sampled' to sample real query vectors, 'synthetic'
             to generate deterministic sigma-point queries from the empirical query
-            Gaussian, or 'mahalanobis_sample' to use the real queries furthest
-            from the empirical query Gaussian by Mahalanobis distance.
+            Gaussian, 'mahalanobis_sample' to use the real queries furthest
+            from the empirical query Gaussian by Mahalanobis distance, or
+            'pc_extreme_sample' to cover positive/negative extremes along query
+            covariance principal components.
             If None, no fit-query subset is passed to downstream fitting.
         fit_query_subset_size : int, optional
             Number of fit queries to produce.
@@ -80,11 +82,22 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
                 "fit_query_subset_size must be None or an int, "
                 f"got {type(fit_query_subset_size).__name__}"
             )
-        valid_fit_query_subset_methods = [None, 'random_sample', 'sampled', 'synthetic', 'mahalanobis_sample']
+        if fit_query_subset_size is not None and fit_query_subset_size > 512:
+            raise ValueError(
+                f"fit_query_subset_size must be <= 512, got {fit_query_subset_size}"
+            )
+        valid_fit_query_subset_methods = [
+            None,
+            'random_sample',
+            'sampled',
+            'synthetic',
+            'mahalanobis_sample',
+            'pc_extreme_sample',
+        ]
         if fit_query_subset_method not in valid_fit_query_subset_methods:
             raise ValueError(
                 "fit_query_subset_method must be None, 'random_sample', 'sampled', "
-                "'synthetic', or 'mahalanobis_sample', "
+                "'synthetic', 'mahalanobis_sample', or 'pc_extreme_sample', "
                 f"got '{fit_query_subset_method}'"
             )
         if (fit_query_subset_method is None) != (fit_query_subset_size is None):
@@ -170,6 +183,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         self.last_diagnostics = {}
         C1, beta, indices, fit_queries = self._select_keys_highest_expected_attention(
             K,
+            V,
             queries,
             t,
             attention_bias,
@@ -247,6 +261,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
     def _select_keys_highest_expected_attention(
         self,
         K: torch.Tensor,
+        V: torch.Tensor,
         queries: torch.Tensor,
         t: int,
         attention_bias: torch.Tensor = None,
@@ -254,12 +269,15 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         fit_query_subset_size: int = None,
     ):
         """
-        Select t keys from K with highest Gaussian expected exp-scores.
+        Select t keys from K with highest Gaussian expected attention scores,
+        weighted by value norm.
 
         Parameters
         ----------
         K : Tensor, shape (T, d)
             Original key matrix.
+        V : Tensor, shape (T, d)
+            Original value matrix.
         queries : Tensor, shape (n, d)
             Sampled query vectors.
         t : int
@@ -268,8 +286,8 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
             Additive per-key attention bias for the original cache (broadcastable to (T,)).
         fit_query_subset_method : str, optional
             Method to produce fit queries: 'random_sample'/'sampled',
-            'synthetic', or 'mahalanobis_sample'. If None, no fit-query subset is
-            passed to downstream fitting.
+            'synthetic', 'mahalanobis_sample', or 'pc_extreme_sample'. If None,
+            no fit-query subset is passed to downstream fitting.
         fit_query_subset_size : int, optional
             Number of fit queries to produce.
 
@@ -290,7 +308,7 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         1. compute query gaussian params (mu is a d-dim vector, sigma is a dxd matrix)
         2. compute the linear term: K @ mu / sqrt(d)
         3. compute the quadratic term: einsum("ij,jk,ik -> i", K, sigma, K) / (2d)
-        4. add, compute exponential, then top-k
+        4. add, softmax over keys, weight by value norm, then top-k
         """
         T, d = K.size()
         n, _ = queries.size()
@@ -309,8 +327,13 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         if fit_query_subset_method is None:
             log_expected_unbiased = self._log_expected_exp_scores(K32, mu, sigma)
             log_expected = log_expected_unbiased + bias32 if bias32 is not None else log_expected_unbiased
-            key_scores = log_expected
+            value_norms = V.to(torch.float32).norm(dim=1)
+            key_scores = torch.softmax(log_expected, dim=0) * value_norms
         else:
+            if fit_query_subset_size > 512:
+                raise ValueError(
+                    f"fit_query_subset_size must be <= 512, got {fit_query_subset_size}"
+                )
             if fit_query_subset_method in ["random_sample", "sampled"]:
                 fit_query_indices = torch.randperm(n, device=device)[:fit_query_subset_size]
                 fit_queries = queries[fit_query_indices]
@@ -324,10 +347,18 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
                     sigma,
                     fit_query_subset_size,
                 )
+            elif fit_query_subset_method == "pc_extreme_sample":
+                fit_queries = self._select_pc_extreme_fit_queries(
+                    queries32,
+                    queries,
+                    mu,
+                    sigma,
+                    fit_query_subset_size,
+                )
             else:
                 raise ValueError(
                     "fit_query_subset_method must be None, 'random_sample', 'sampled', "
-                    "'synthetic', or 'mahalanobis_sample', "
+                    "'synthetic', 'mahalanobis_sample', or 'pc_extreme_sample', "
                     f"got '{fit_query_subset_method}'"
                 )
 
@@ -443,6 +474,60 @@ class HighestExpectedAttentionKeysCompaction(CompactionAlgorithm):
         centered = queries32 - mu
         distances = torch.einsum("ij,jk,ik->i", centered, sigma_pinv, centered)
         _, fit_query_indices = torch.topk(distances, num_queries, largest=True)
+        return queries[fit_query_indices]
+
+    @staticmethod
+    def _select_pc_extreme_fit_queries(queries32, queries, mu, sigma, num_queries):
+        """
+        Select real query vectors from both tails of high-variance query PCs.
+
+        This favors broad tail coverage over only the largest Mahalanobis norms,
+        which empirically tracks normalized full-attention key rankings better
+        when the score objective is sensitive to per-query attention spikes.
+        """
+        if num_queries < 1:
+            raise ValueError("fit_query_subset_size must be at least 1")
+        if num_queries > queries32.shape[0]:
+            raise ValueError(
+                "fit_query_subset_size must be less than or equal to the number "
+                f"of training queries for pc_extreme_sample: got {num_queries}, "
+                f"number of training queries is {queries32.shape[0]}"
+            )
+
+        sigma = 0.5 * (sigma + sigma.T)
+        eigvals, eigvecs = torch.linalg.eigh(sigma)
+        order = torch.argsort(eigvals.clamp_min(0.0), descending=True)
+        eigvecs = eigvecs[:, order]
+        projected = (queries32 - mu.unsqueeze(0)) @ eigvecs
+
+        selected = []
+        seen = set()
+        pc_count = min(projected.shape[1], max(1, num_queries // 2))
+        for pc_idx in range(pc_count):
+            for sign in (1.0, -1.0):
+                ranked = torch.argsort(sign * projected[:, pc_idx], descending=True)
+                for idx in ranked.detach().cpu().tolist():
+                    if idx not in seen:
+                        seen.add(idx)
+                        selected.append(idx)
+                        break
+                if len(selected) >= num_queries:
+                    break
+            if len(selected) >= num_queries:
+                break
+
+        if len(selected) < num_queries:
+            sigma_pinv = torch.linalg.pinv(sigma)
+            centered = queries32 - mu.unsqueeze(0)
+            distances = torch.einsum("ij,jk,ik->i", centered, sigma_pinv, centered)
+            for idx in torch.argsort(distances, descending=True).detach().cpu().tolist():
+                if idx not in seen:
+                    seen.add(idx)
+                    selected.append(idx)
+                    if len(selected) >= num_queries:
+                        break
+
+        fit_query_indices = torch.tensor(selected[:num_queries], dtype=torch.long, device=queries.device)
         return queries[fit_query_indices]
 
     @staticmethod

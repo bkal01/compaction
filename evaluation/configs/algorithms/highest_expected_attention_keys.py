@@ -62,6 +62,17 @@ def mahalanobis(beta_method, c2_method, m, score_method='rms', **overrides):
     )
 
 
+def pc_extreme(beta_method, c2_method, m, score_method='rms', **overrides):
+    return expected(
+        beta_method,
+        c2_method,
+        score_method=score_method,
+        fit_query_subset_method='pc_extreme_sample',
+        fit_query_subset_size=m,
+        **overrides,
+    )
+
+
 config = {
     # Main full-attention baseline. This uses the same C2 solver default as the
     # expected-attention methods below.
@@ -173,9 +184,6 @@ config = {
     'expected_redist_lsq_sampled512_ridge1e-2': sampled(
         'redistribute_uniform', 'lsq', 512, c2_ridge_lambda=1e-2
     ),
-    'expected_redist_lsq_sampled1024_ridge1e-2': sampled(
-        'redistribute_uniform', 'lsq', 1024, c2_ridge_lambda=1e-2
-    ),
     'expected_nnls_lsq_sampled64_ridge1e-2': sampled(
         'nnls', 'lsq', 64, c2_ridge_lambda=1e-2
     ),
@@ -187,9 +195,6 @@ config = {
     ),
     'expected_nnls_lsq_sampled512_ridge1e-2': sampled(
         'nnls', 'lsq', 512, c2_ridge_lambda=1e-2
-    ),
-    'expected_nnls_lsq_sampled1024_ridge1e-2': sampled(
-        'nnls', 'lsq', 1024, c2_ridge_lambda=1e-2
     ),
     'expected_nnls_direct_sampled256': sampled(
         'nnls', 'direct', 256
@@ -233,6 +238,24 @@ config = {
     ),
     'expected_nnls_direct_mahalanobis256': mahalanobis(
         'nnls', 'direct', 256
+    ),
+    'expected_zero_direct_pc_extreme384': pc_extreme(
+        'zero', 'direct', 384
+    ),
+    'expected_zero_direct_pc_extreme448': pc_extreme(
+        'zero', 'direct', 448
+    ),
+    'expected_redist_direct_pc_extreme384': pc_extreme(
+        'redistribute_uniform', 'direct', 384
+    ),
+    'expected_redist_direct_pc_extreme448': pc_extreme(
+        'redistribute_uniform', 'direct', 448
+    ),
+    'expected_redist_lsq_pc_extreme384_ridge1e-2': pc_extreme(
+        'redistribute_uniform', 'lsq', 384, c2_ridge_lambda=1e-2
+    ),
+    'expected_redist_lsq_pc_extreme448_ridge1e-2': pc_extreme(
+        'redistribute_uniform', 'lsq', 448, c2_ridge_lambda=1e-2
     ),
 
     # Synthetic-query key selection + beta/C2 fitting variants. These use
