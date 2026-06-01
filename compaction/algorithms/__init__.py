@@ -17,6 +17,7 @@ from .random_vector_keys import RandomVectorKeysCompaction
 from .truncate import TruncationCompaction
 from .highest_attention_keys import HighestAttentionKeysCompaction
 from .highest_expected_attention_keys import HighestExpectedAttentionKeysCompaction
+from .selective_exact import SelectiveExactCompaction
 from .kvmerger import KVMergerCompaction
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     'TruncationCompaction',
     'HighestAttentionKeysCompaction',
     'HighestExpectedAttentionKeysCompaction',
+    'SelectiveExactCompaction',
     'KVMergerCompaction',
 ]
 
@@ -50,5 +52,6 @@ ALGORITHM_REGISTRY = {
     'batched_optim_joint': BatchedOptimJointCompaction,
     'highest_attention_keys': HighestAttentionKeysCompaction,
     'highest_expected_attention_keys': HighestExpectedAttentionKeysCompaction,
+    'selective_exact': SelectiveExactCompaction,
     'kvmerger': KVMergerCompaction,
 }
