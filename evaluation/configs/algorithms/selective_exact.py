@@ -58,6 +58,8 @@ config = {
     # -------------------------------------------------------------------------
     # Recommended configs: direct C2 (no LSQ overhead, best QA accuracy)
     # -------------------------------------------------------------------------
+    'selective_exact_zero_direct': selective_exact(5, 256, 'zero', 'direct'), # maps to ser5_256_redist_direct
+
     'ser3_256_redist_direct': selective_exact(3, 256, 'redistribute_uniform', 'direct'),
     'ser3_512_redist_direct': selective_exact(3, 512, 'redistribute_uniform', 'direct'),
     'ser4_256_redist_direct': selective_exact(4, 256, 'redistribute_uniform', 'direct'),

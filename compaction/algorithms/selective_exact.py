@@ -60,8 +60,9 @@ class SelectiveExactCompaction(CompactionAlgorithm):
             key score: 'rms' (default), 'mean', or 'max'.
         beta_method : str
             'redistribute_uniform' to uniformly redistribute estimated missing
-            attention mass (default), or 'nnls' for the clamped-least-squares
-            partition mass matching solution.
+            attention mass (default), 'nnls' for the clamped-least-squares
+            partition mass matching solution, or 'zero' to set all beta values
+            to zero.
         c2_method : str
             'direct' to set C2 = V[selected_indices] (default; recommended),
             or 'lsq' to fit C2 via least squares against the rough-pass queries.
@@ -86,9 +87,10 @@ class SelectiveExactCompaction(CompactionAlgorithm):
             raise ValueError(f"n_rough must be <= 512, got {n_rough}")
         if score_method not in ['rms', 'mean', 'max']:
             raise ValueError(f"score_method must be 'rms', 'mean', or 'max', got '{score_method}'")
-        if beta_method not in ['redistribute_uniform', 'nnls']:
+        if beta_method not in ['redistribute_uniform', 'nnls', 'zero']:
             raise ValueError(
-                f"beta_method must be 'redistribute_uniform' or 'nnls', got '{beta_method}'"
+                "beta_method must be 'redistribute_uniform', 'nnls', or "
+                f"'zero', got '{beta_method}'"
             )
         if c2_method not in ['direct', 'lsq']:
             raise ValueError(f"c2_method must be 'direct' or 'lsq', got '{c2_method}'")
@@ -186,7 +188,9 @@ class SelectiveExactCompaction(CompactionAlgorithm):
         indices = sel_idx.cpu().tolist()
 
         # --- Beta ---
-        if self.beta_method == 'redistribute_uniform':
+        if self.beta_method == 'zero':
+            beta32 = torch.zeros(t, dtype=torch.float32, device=device)
+        elif self.beta_method == 'redistribute_uniform':
             # All n queries, Z_cand as proxy for Z_full — no extra matmul.
             sel_unnorm = exact_w[:, sel_in_cand] * exact_Z_cand  # (n, t)
             Z_sel = sel_unnorm.sum(dim=1)  # (n,)

@@ -34,7 +34,9 @@ class HighestAttentionKeysCompaction(CompactionAlgorithm):
         c2_method : str
             Method to compute C2: 'lsq' for least squares (default) or 'direct' for nearest neighbor selection.
         beta_method : str, optional
-            Method to compute beta: 'nnls' to solve via NNLS (default) or 'zero' to set all beta=0.
+            Method to compute beta: 'nnls' to solve via NNLS (default),
+            'redistribute_uniform' to uniformly redistribute missing partition
+            mass across selected keys, or 'zero' to set all beta=0.
         c2_ridge_lambda : float
             Regularization parameter for C2 ridge regression (default: 0).
         c2_solver : str
@@ -53,8 +55,10 @@ class HighestAttentionKeysCompaction(CompactionAlgorithm):
             raise ValueError(f"score_method must be 'mean', 'rms', or 'max', got '{score_method}'")
         self.score_method = score_method
         self.c2_method = c2_method
-        if beta_method not in ['nnls', 'zero']:
-            raise ValueError(f"beta_method must be 'nnls' or 'zero', got '{beta_method}'")
+        if beta_method not in ['nnls', 'redistribute_uniform', 'zero']:
+            raise ValueError(
+                f"beta_method must be 'nnls', 'redistribute_uniform', or 'zero', got '{beta_method}'"
+            )
         self.beta_method = beta_method
         self.c2_ridge_lambda = c2_ridge_lambda
         self.c2_solver = c2_solver
@@ -212,6 +216,16 @@ class HighestAttentionKeysCompaction(CompactionAlgorithm):
         if self.beta_method == 'zero':
             # Set all beta values to 0 (compute in fp32, then convert to model dtype)
             beta32 = torch.zeros(t, dtype=torch.float32, device=device)
+        elif self.beta_method == 'redistribute_uniform':
+            selected_unnorm = exp_scores[:, selected_indices_tensor]  # (n, t) fp32
+            selected_mass = selected_unnorm.sum(dim=1)  # (n,) fp32
+            missing_mass = (sum_exp.squeeze(1) - selected_mass).clamp_min(0.0).mean()
+            selected_base_mass = selected_unnorm.mean(dim=0)  # (t,) fp32
+            B = (
+                (selected_base_mass + missing_mass / t).clamp_min(1e-12)
+                / selected_base_mass.clamp_min(1e-12)
+            )
+            beta32 = torch.log(B)  # (t,) fp32
         else:  # 'nnls'
             # Compute target for NNLS
             target = exp_scores.sum(dim=1)  # (n,) fp32
